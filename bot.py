@@ -528,7 +528,7 @@ async def show_accepted_orders(callback: CallbackQuery):
     orders = get_orders(status='accepted')
     if not orders:
         await callback.message.edit_text("📭 Нет принятых заказов.", reply_markup=seller_menu())
-        await callback.answer()
+        await callback.answer() 
         return
     
     text = "✅ *Принятые заказы:*\n\n"
