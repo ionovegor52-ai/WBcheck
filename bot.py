@@ -71,7 +71,8 @@ class AddProductState(StatesGroup):
     waiting_for_url = State()
     waiting_for_category = State()
     waiting_for_target_price = State()
-
+    waiting_for_category_name = State()
+    
 class SetTargetPriceState(StatesGroup):
     waiting_for_price = State()
 
