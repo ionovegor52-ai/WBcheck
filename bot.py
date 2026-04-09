@@ -1,9 +1,8 @@
 import asyncio
 import aiohttp
 import sqlite3
-import re
 import os
-import json
+import re
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -14,597 +13,682 @@ from aiohttp import web
 
 # ========== КОНФИГ ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RENDER_URL = os.environ.get("RENDER_URL", "https://wbcheck.onrender.com")
+RENDER_URL = os.environ.get("RENDER_URL", "https://crm-bot.onrender.com")
+
+# Данные продавца (единственный продавец)
+SELLER_LOGIN = "admin"
+SELLER_PASSWORD = "12345"
 
 # База данных
-conn = sqlite3.connect("prices.db", check_same_thread=False)
+conn = sqlite3.connect("crm.db", check_same_thread=False)
 cursor = conn.cursor()
 
 # Таблицы
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    join_date TEXT
+    role TEXT DEFAULT 'client',
+    blocked INTEGER DEFAULT 0,
+    name TEXT,
+    phone TEXT,
+    joined_date TEXT
 )
-""") 
+""")
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS products (
+CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    url TEXT,
-    name TEXT,
-    last_price REAL,
-    min_price REAL,
-    max_price REAL,
-    target_price REAL,
-    category TEXT,
-    in_stock INTEGER DEFAULT 1,
-    added_date TEXT,
+    service TEXT,
+    comment TEXT,
+    contact TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT,
+    seller_response TEXT,
+    seller_responded_at TEXT,
     FOREIGN KEY (user_id) REFERENCES users (user_id)
 )
 """)
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS price_history (
+CREATE TABLE IF NOT EXISTS services (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER,
-    price REAL,
-    in_stock INTEGER,
-    check_date TEXT,
-    FOREIGN KEY (product_id) REFERENCES products (id)
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    name TEXT,
-    UNIQUE(user_id, name)
+    name TEXT UNIQUE,
+    price TEXT,
+    description TEXT
 )
 """)
 conn.commit()
 
-# Состояния FSM
-class AddProductState(StatesGroup):
-    waiting_for_url = State()
-    waiting_for_category = State()
-    waiting_for_target_price = State()
-    waiting_for_category_name = State()
+# Добавляем тестовые услуги
+cursor.execute("SELECT COUNT(*) FROM services")
+if cursor.fetchone()[0] == 0:
+    services = [
+        ("Разработка сайта", "от 10000 ₽", "Лендинг, интернет-магазин, корпоративный сайт"),
+        ("SEO-продвижение", "от 5000 ₽/мес", "Вывод в топ 10 по целевым запросам"),
+        ("Telegram-бот", "от 3000 ₽", "Бот для бизнеса под ключ"),
+        ("Дизайн", "от 2000 ₽", "Логотип, фирменный стиль, баннеры"),
+        ("Консультация", "1000 ₽/час", "Помощь с IT-проектами"),
+    ]
+    for name, price, desc in services:
+        cursor.execute("INSERT INTO services (name, price, description) VALUES (?, ?, ?)", (name, price, desc))
+    conn.commit()
 
-class SetTargetPriceState(StatesGroup):
-    waiting_for_price = State()
+# Состояния
+class ClientOrderState(StatesGroup):
+    waiting_for_service = State()
+    waiting_for_comment = State()
+    waiting_for_contact = State()
 
-# Инициализация бота
+class SellerReplyState(StatesGroup):
+    waiting_for_reply = State()
+
+class SellerLoginState(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+
+# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ========== ФУНКЦИИ ПАРСИНГА ==========
-async def parse_wildberries(url_or_article):
-    try:
-        # Извлекаем артикул
-        match = re.search(r'/(\d+)/', url_or_article)
-        if not match:
-            if url_or_article.isdigit():
-                article = url_or_article
-            else:
-                return None, None, None
-        else:
-            article = match.group(1)
-        
-        # Используем официальное API Wildberries
-        api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15) as resp:
-                if resp.status != 200:
-                    print(f"API вернул статус {resp.status}")
-                    return None, None, None
-                
-                data = await resp.json()
-                
-                # Проверяем структуру ответа
-                products = data.get("data", {}).get("products", [])
-                if not products:
-                    print(f"Товар {article} не найден")
-                    return None, None, None
-                
-                product = products[0]
-                
-                # Цена в копейках, делим на 100
-                price = product.get("salePriceU", 0) / 100
-                if price == 0:
-                    price = product.get("priceU", 0) / 100
-                
-                name = product.get("name", "Неизвестный товар")
-                
-                # Проверка наличия (totalQuantity может отсутствовать)
-                in_stock = product.get("totalQuantity", 0) > 0
-                
-                return price, name, in_stock
-                
-    except Exception as e:
-        print(f"Ошибка парсинга WB: {e}")
-        return None, None, None
-
-async def parse_ozon(url_or_article):
-    try:
-        # Извлекаем артикул
-        match = re.search(r'/product/(\d+)', url_or_article)
-        if not match:
-            if url_or_article.isdigit():
-                article = url_or_article
-            else:
-                return None, None, None
-        else:
-            article = match.group(1)
-        
-        ozon_url = f"https://www.ozon.ru/product/{article}/"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ozon_url, headers=headers, timeout=15) as resp:
-                html = await resp.text()
-                
-                # Ищем цену в JSON-подобных данных
-                price = None
-                name = None
-                
-                # Пробуем найти в script тегах
-                match = re.search(r'"price":"([\d\s]+)"', html)
-                if match:
-                    price = float(match.group(1).replace(' ', ''))
-                
-                if not price:
-                    match = re.search(r'"current_price":([\d.]+)', html)
-                    if match:
-                        price = float(match.group(1))
-                
-                # Ищем название
-                match_name = re.search(r'"name":"([^"]+)"', html)
-                if match_name:
-                    name = match_name.group(1)
-                
-                if not name:
-                    name = "Неизвестный товар"
-                
-                in_stock = "Нет в наличии" not in html and "Товар закончился" not in html
-                
-                return price, name, in_stock
-                
-    except Exception as e:
-        print(f"Ошибка парсинга Ozon: {e}")
-        return None, None, None
-
-async def parse_price(url_or_article):
-    """Парсит цену по артикулу или ссылке"""
-    # Если артикул (только цифры)
-    if url_or_article.isdigit():
-        # Пробуем Wildberries
-        price, name, in_stock = await parse_wildberries(url_or_article)
-        if price:
-            return price, name, in_stock
-        # Пробуем Ozon
-        price, name, in_stock = await parse_ozon(url_or_article)
-        return price, name, in_stock
-    
-    # Если ссылка
-    if "wildberries" in url_or_article.lower():
-        return await parse_wildberries(url_or_article)
-    elif "ozon" in url_or_article.lower():
-        return await parse_ozon(url_or_article)
-    else:
-        return None, None, None
-
-# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
-def register_user(user_id):
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, join_date) VALUES (?, ?)", 
+# ========== ФУНКЦИИ ==========
+def register_user(user_id, name=None, phone=None):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, role, blocked, joined_date) VALUES (?, 'client', 0, ?)", 
                    (user_id, datetime.now().isoformat()))
+    if name or phone:
+        cursor.execute("UPDATE users SET name = ?, phone = ? WHERE user_id = ?", (name, phone, user_id))
     conn.commit()
 
-def get_user_categories(user_id):
-    cursor.execute("SELECT name FROM categories WHERE user_id = ?", (user_id,))
-    return [row[0] for row in cursor.fetchall()]
+def is_blocked(user_id):
+    cursor.execute("SELECT blocked FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    return result and result[0] == 1
 
-def add_category(user_id, name):
-    try:
-        cursor.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user_id, name))
-        conn.commit()
-        return True
-    except:
-        return False
+def is_seller(user_id):
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    return result and result[0] == 'seller'
 
-def get_user_products(user_id):
-    cursor.execute("SELECT id, name, last_price, url, category, in_stock FROM products WHERE user_id = ?", (user_id,))
+def add_order(user_id, service, comment, contact):
+    cursor.execute("""
+        INSERT INTO orders (user_id, service, comment, contact, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, service, comment, contact, datetime.now().isoformat()))
+    conn.commit()
+    return cursor.lastrowid
+
+def get_orders(status=None, user_id=None):
+    if status and user_id:
+        cursor.execute("SELECT id, user_id, service, comment, contact, status, created_at, seller_response FROM orders WHERE status = ? AND user_id = ? ORDER BY created_at DESC", (status, user_id))
+    elif status:
+        cursor.execute("SELECT id, user_id, service, comment, contact, status, created_at, seller_response FROM orders WHERE status = ? ORDER BY created_at DESC", (status,))
+    elif user_id:
+        cursor.execute("SELECT id, user_id, service, comment, contact, status, created_at, seller_response FROM orders WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    else:
+        cursor.execute("SELECT id, user_id, service, comment, contact, status, created_at, seller_response FROM orders ORDER BY created_at DESC")
     return cursor.fetchall()
 
-def get_product_history(product_id):
-    cursor.execute("SELECT price, check_date FROM price_history WHERE product_id = ? ORDER BY check_date DESC LIMIT 20", (product_id,))
+def update_order_status(order_id, status, response=None):
+    if response:
+        cursor.execute("UPDATE orders SET status = ?, seller_response = ?, seller_responded_at = ? WHERE id = ?", 
+                       (status, response, datetime.now().isoformat(), order_id))
+    else:
+        cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+    conn.commit()
+
+def get_services():
+    cursor.execute("SELECT id, name, price, description FROM services")
     return cursor.fetchall()
+
+def get_user_info(user_id):
+    cursor.execute("SELECT name, phone FROM users WHERE user_id = ?", (user_id,))
+    return cursor.fetchone()
+
+def get_order_count(status=None):
+    if status:
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (status,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM orders")
+    return cursor.fetchone()[0]
+
+def block_user(user_id):
+    cursor.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+def unblock_user(user_id):
+    cursor.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
 
 # ========== КЛАВИАТУРЫ ==========
-def main_menu():
+def main_menu(user_id):
+    if is_seller(user_id):
+        return seller_menu()
+    else:
+        return client_menu()
+
+def client_menu():
     buttons = [
-        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")],
-        [InlineKeyboardButton(text="📋 Мои товары", callback_data="my_products")],
-        [InlineKeyboardButton(text="🛒 Корзины", callback_data="categories")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text="🔄 Проверить цены", callback_data="check_prices")],
-        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+        [InlineKeyboardButton(text="🛒 Сделать заказ", callback_data="new_order")],
+        [InlineKeyboardButton(text="📋 Мои заказы", callback_data="my_orders")],
+        [InlineKeyboardButton(text="ℹ️ О нас", callback_data="about")],
+        [InlineKeyboardButton(text="📞 Контакты", callback_data="contacts")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def products_keyboard(products):
+def seller_menu():
+    buttons = [
+        [InlineKeyboardButton(text="📋 Новые заказы", callback_data="new_orders")],
+        [InlineKeyboardButton(text="✅ Принятые", callback_data="accepted_orders")],
+        [InlineKeyboardButton(text="❌ Отказанные", callback_data="rejected_orders")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="🚫 Заблокированные", callback_data="blocked_users")],
+        [InlineKeyboardButton(text="🚪 Выйти", callback_data="logout")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def service_keyboard():
+    services = get_services()
     buttons = []
-    for prod in products:
-        stock_icon = "✅" if prod[5] else "❌"
-        buttons.append([InlineKeyboardButton(text=f"{stock_icon} {prod[1][:30]} - {prod[2]}₽", callback_data=f"prod_{prod[0]}")])
+    for s in services:
+        buttons.append([InlineKeyboardButton(text=f"{s[1]} - {s[2]}", callback_data=f"service_{s[0]}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def product_detail_keyboard(product_id):
+def orders_keyboard(orders, prefix):
+    buttons = []
+    for order in orders:
+        buttons.append([InlineKeyboardButton(text=f"Заказ #{order[0]} - {order[2][:20]}", callback_data=f"{prefix}_{order[0]}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def order_action_keyboard(order_id):
     buttons = [
-        [InlineKeyboardButton(text="🎯 Целевая цена", callback_data=f"target_{product_id}")],
-        [InlineKeyboardButton(text="📈 История цен", callback_data=f"history_{product_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{product_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="my_products")]
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{order_id}")],
+        [InlineKeyboardButton(text="❌ Отказать", callback_data=f"reject_{order_id}")],
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{order_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="new_orders")]
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def blocked_users_keyboard():
+    cursor.execute("SELECT user_id, name, phone FROM users WHERE role = 'client' AND blocked = 1")
+    users = cursor.fetchall()
+    buttons = []
+    for u in users:
+        name = u[1] if u[1] else f"ID:{u[0]}"
+        buttons.append([InlineKeyboardButton(text=f"🔓 {name}", callback_data=f"unblock_{u[0]}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ========== ОБРАБОТЧИКИ ==========
 @dp.message(Command("start"))
 async def start_command(message: Message):
-    register_user(message.from_user.id)
+    user_id = message.from_user.id
+    
+    if is_blocked(user_id):
+        await message.answer("🚫 *Вы заблокированы!* Обратитесь к администратору.", parse_mode="Markdown")
+        return
+    
+    register_user(user_id)
+    
     await message.answer(
-        "🤖 *Продвинутый парсер цен*\n\n"
-        "Я отслеживаю цены на Wildberries и Ozon!\n\n"
-        "📌 *Что умею:*\n"
-        "• 📉 Снижение цены\n"
-        "• 📈 Повышение цены\n"
-        "• ⚠️ Пропажа товара\n"
-        "• 🛒 Корзины для группировки\n"
-        "• 🎯 Целевая цена\n"
-        "• 📊 График цен\n\n"
-        "📌 *Как добавить товар:*\n"
-        "• По артикулу: просто введи цифры (12345678)\n"
-        "• По ссылке: отправь ссылку с WB или Ozon\n\n"
-        "👇 Выбери действие:",
-        reply_markup=main_menu(),
+        "🤝 *Добро пожаловать!*\n\n"
+        "Я помогу вам оформить заказ или получить консультацию.\n\n"
+        "👇 Выберите действие:",
+        reply_markup=main_menu(user_id),
         parse_mode="Markdown"
     )
 
-@dp.callback_query(F.data == "add_product")
-async def add_product_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AddProductState.waiting_for_url)
+@dp.callback_query(F.data == "back")
+async def back_to_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text("🤝 Главное меню:", reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "new_order")
+async def new_order_start(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    
+    if is_blocked(user_id):
+        await callback.answer("Вы заблокированы!", show_alert=True)
+        return
+    
+    await state.set_state(ClientOrderState.waiting_for_service)
     await callback.message.edit_text(
-        "🔗 Отправь *артикул* или *ссылку* на товар:\n\n"
-        "✅ *Примеры:*\n"
-        "• Артикул WB: `12345678`\n"
-        "• Артикул Ozon: `123456789`\n"
-        "• Ссылка WB: https://www.wildberries.ru/catalog/12345678/detail.aspx\n"
-        "• Ссылка Ozon: https://www.ozon.ru/product/123456789/\n\n"
-        "❌ Нажми «Отмена» чтобы вернуться",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back")]]),
+        "🛒 *Выберите услугу:*",
+        reply_markup=service_keyboard(),
         parse_mode="Markdown"
     )
     await callback.answer()
 
-@dp.message(AddProductState.waiting_for_url)
-async def process_url(message: Message, state: FSMContext):
-    url_or_article = message.text.strip()
-    await message.answer("🔄 Парсю товар...")
+@dp.callback_query(ClientOrderState.waiting_for_service, F.data.startswith("service_"))
+async def select_service(callback: CallbackQuery, state: FSMContext):
+    service_id = int(callback.data.split("_")[1])
+    cursor.execute("SELECT name, price, description FROM services WHERE id = ?", (service_id,))
+    service = cursor.fetchone()
     
-    price, name, in_stock = await parse_price(url_or_article)
+    await state.update_data(service=f"{service[0]} ({service[1]})")
+    await state.set_state(ClientOrderState.waiting_for_comment)
     
-    if price is None:
-        await message.answer("❌ Не удалось распознать артикул или ссылку.\n\n"
-                           "✅ *Правильные форматы:*\n"
-                           "• Артикул WB: `12345678`\n"
-                           "• Артикул Ozon: `123456789`\n"
-                           "• Ссылка WB: https://www.wildberries.ru/catalog/12345678/detail.aspx\n"
-                           "• Ссылка Ozon: https://www.ozon.ru/product/123456789/",
-                           parse_mode="Markdown")
-        return
-    
-    await state.update_data(url=url_or_article, name=name, price=price, in_stock=in_stock)
-    
-    categories = get_user_categories(message.from_user.id)
-    buttons = []
-    for cat in categories:
-        buttons.append([InlineKeyboardButton(text=cat, callback_data=f"cat_{cat}")])
-    buttons.append([InlineKeyboardButton(text="➕ Новая корзина", callback_data="new_cat")])
-    buttons.append([InlineKeyboardButton(text="📁 Без корзины", callback_data="cat_None")])
-    
-    await state.set_state(AddProductState.waiting_for_category)
+    await callback.message.edit_text(
+        f"📝 Вы выбрали: *{service[0]}*\n\n"
+        f"💰 {service[1]}\n"
+        f"ℹ️ {service[2]}\n\n"
+        f"Напишите *комментарий* к заказу (или нажмите «Пропустить»):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_comment")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(ClientOrderState.waiting_for_comment, F.data == "skip_comment")
+async def skip_comment(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(comment="Без комментария")
+    await state.set_state(ClientOrderState.waiting_for_contact)
+    await callback.message.edit_text(
+        "📞 Напишите *контактные данные* для связи (телефон, Telegram, email):\n\n"
+        "Пример: `+7 999 123-45-67` или `@username`",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.message(ClientOrderState.waiting_for_comment)
+async def process_comment(message: Message, state: FSMContext):
+    await state.update_data(comment=message.text)
+    await state.set_state(ClientOrderState.waiting_for_contact)
     await message.answer(
-        f"📦 *{name}*\n💰 Цена: {price} ₽\n{'✅ В наличии' if in_stock else '❌ Нет в наличии'}\n\n"
-        f"Выбери корзину:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        "📞 Напишите *контактные данные* для связи (телефон, Telegram, email):\n\n"
+        "Пример: `+7 999 123-45-67` или `@username`",
         parse_mode="Markdown"
     )
 
-@dp.callback_query(AddProductState.waiting_for_category, F.data.startswith("cat_"))
-async def process_category(callback: CallbackQuery, state: FSMContext):
-    category = callback.data.replace("cat_", "")
-    if category == "None":
-        category = None
-    elif category == "new_cat":
-        await callback.message.edit_text("Введи название новой корзины:")
-        await state.set_state(AddProductState.waiting_for_category_name)
+@dp.message(ClientOrderState.waiting_for_contact)
+async def process_contact(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = add_order(message.from_user.id, data['service'], data['comment'], message.text)
+    
+    # Обновляем контакты пользователя
+    cursor.execute("UPDATE users SET name = ?, phone = ? WHERE user_id = ?", 
+                   (message.from_user.full_name, message.text, message.from_user.id))
+    conn.commit()
+    
+    await message.answer(
+        f"✅ *Заказ оформлен!*\n\n"
+        f"📦 Услуга: {data['service']}\n"
+        f"📝 Комментарий: {data['comment']}\n"
+        f"📞 Контакт: {message.text}\n"
+        f"🆔 Номер заказа: {order_id}\n\n"
+        f"Скоро с вами свяжется наш менеджер!",
+        parse_mode="Markdown",
+        reply_markup=main_menu(message.from_user.id)
+    )
+    
+    # Отправляем уведомление продавцу (если есть)
+    cursor.execute("SELECT user_id FROM users WHERE role = 'seller'")
+    sellers = cursor.fetchall()
+    for seller in sellers:
+        try:
+            await bot.send_message(
+                seller[0],
+                f"🆕 *Новый заказ!*\n\n"
+                f"🆔 #{order_id}\n"
+                f"👤 Клиент: {message.from_user.full_name}\n"
+                f"📦 Услуга: {data['service']}\n"
+                f"📝 Комментарий: {data['comment']}\n"
+                f"📞 Контакт: {message.text}\n\n"
+                f"Используйте меню продавца для управления заказами.",
+                parse_mode="Markdown",
+                reply_markup=main_menu(seller[0])
+            )
+        except:
+            pass
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "my_orders")
+async def show_my_orders(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    orders = get_orders(user_id=user_id)
+    
+    if not orders:
+        await callback.message.edit_text("📭 У вас пока нет заказов.", reply_markup=main_menu(user_id))
         await callback.answer()
         return
     
-    await state.update_data(category=category)
-    await state.set_state(AddProductState.waiting_for_target_price)
-    await callback.message.edit_text(
-        "🎯 Установи целевую цену (при достижении пришлю уведомление)\n\n"
-        "Введи число или нажми «Пропустить»:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_target")]])
-    )
+    text = "📋 *Ваши заказы:*\n\n"
+    for order in orders[:10]:
+        status_icon = {
+            'pending': '⏳',
+            'accepted': '✅',
+            'rejected': '❌'
+        }.get(order[5], '❓')
+        text += f"{status_icon} *Заказ #{order[0]}*\n"
+        text += f"📦 {order[2]}\n"
+        text += f"📅 {order[6][:16]}\n"
+        if order[7]:
+            text += f"💬 Ответ: {order[7]}\n"
+        text += "\n"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu(user_id))
     await callback.answer()
 
-@dp.callback_query(AddProductState.waiting_for_target_price, F.data == "skip_target")
-async def skip_target(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(target_price=None)
-    
-    data = await state.get_data()
-    cursor.execute("""
-        INSERT INTO products (user_id, url, name, last_price, min_price, max_price, target_price, category, in_stock, added_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (callback.from_user.id, data['url'], data['name'], data['price'], data['price'], data['price'], 
-          data['target_price'], data['category'], 1 if data['in_stock'] else 0, datetime.now().isoformat()))
-    product_id = cursor.lastrowid
-    
-    cursor.execute("INSERT INTO price_history (product_id, price, in_stock, check_date) VALUES (?, ?, ?, ?)",
-                   (product_id, data['price'], 1 if data['in_stock'] else 0, datetime.now().isoformat()))
-    conn.commit()
-    
-    await callback.message.edit_text(
-        f"✅ *Товар добавлен!*\n\n"
-        f"📦 {data['name']}\n"
-        f"💰 {data['price']} ₽\n"
-        f"📁 Корзина: {data['category'] or 'Без корзины'}\n\n"
-        f"🔔 Буду следить за ценой каждые 30 минут!",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
-    )
-    await state.clear()
-    await callback.answer()
-
-@dp.message(AddProductState.waiting_for_target_price)
-async def process_target_price(message: Message, state: FSMContext):
-    try:
-        target_price = float(message.text.replace(",", "."))
-    except:
-        await message.answer("❌ Введи число или нажми «Пропустить»")
+@dp.callback_query(F.data == "new_orders")
+async def show_new_orders(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
         return
     
-    await state.update_data(target_price=target_price)
+    orders = get_orders(status='pending')
+    if not orders:
+        await callback.message.edit_text("📭 Нет новых заказов.", reply_markup=seller_menu())
+        await callback.answer()
+        return
     
-    data = await state.get_data()
-    cursor.execute("""
-        INSERT INTO products (user_id, url, name, last_price, min_price, max_price, target_price, category, in_stock, added_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (message.from_user.id, data['url'], data['name'], data['price'], data['price'], data['price'], 
-          data['target_price'], data['category'], 1 if data['in_stock'] else 0, datetime.now().isoformat()))
-    product_id = cursor.lastrowid
-    
-    cursor.execute("INSERT INTO price_history (product_id, price, in_stock, check_date) VALUES (?, ?, ?, ?)",
-                   (product_id, data['price'], 1 if data['in_stock'] else 0, datetime.now().isoformat()))
-    conn.commit()
-    
-    await message.answer(
-        f"✅ *Товар добавлен!*\n\n"
-        f"📦 {data['name']}\n"
-        f"💰 {data['price']} ₽\n"
-        f"🎯 Цель: {target_price} ₽\n"
-        f"📁 Корзина: {data['category'] or 'Без корзины'}\n\n"
-        f"🔔 Буду следить за ценой каждые 30 минут!",
-        parse_mode="Markdown",
-        reply_markup=main_menu()
+    await callback.message.edit_text(
+        "📋 *Новые заказы:*\n\n"
+        f"Всего: {len(orders)}",
+        reply_markup=orders_keyboard(orders, "order"),
+        parse_mode="Markdown"
     )
-    await state.clear()
+    await callback.answer()
 
-@dp.message(AddProductState.waiting_for_category_name)
-async def new_category_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if add_category(message.from_user.id, name):
-        await message.answer(f"✅ Корзина «{name}» создана!\n\nТеперь добавь товар заново.")
+@dp.callback_query(F.data.startswith("order_"))
+async def view_order(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    cursor.execute("""
+        SELECT o.id, o.user_id, o.service, o.comment, o.contact, o.status, o.created_at,
+               u.name, u.phone
+        FROM orders o
+        JOIN users u ON o.user_id = u.user_id
+        WHERE o.id = ?
+    """, (order_id,))
+    order = cursor.fetchone()
+    
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    
+    text = f"🆔 *Заказ #{order[0]}*\n\n"
+    text += f"👤 Клиент: {order[7] or 'Не указан'}\n"
+    text += f"📞 Контакт: {order[4]}\n"
+    text += f"📦 Услуга: {order[2]}\n"
+    text += f"📝 Комментарий: {order[3]}\n"
+    text += f"📅 Создан: {order[6][:16]}\n"
+    text += f"📊 Статус: {order[5]}\n"
+    
+    if order[5] == 'pending':
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=order_action_keyboard(order_id))
     else:
-        await message.answer(f"❌ Корзина «{name}» уже существует")
-    await state.clear()
-    await start_command(message)
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="new_orders")]]))
+    
+    await callback.answer()
 
-@dp.callback_query(F.data == "my_products")
-async def show_products(callback: CallbackQuery):
-    products = get_user_products(callback.from_user.id)
-    if not products:
-        await callback.message.edit_text("📭 У тебя пока нет товаров.", reply_markup=main_menu())
+@dp.callback_query(F.data.startswith("accept_"))
+async def accept_order(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    update_order_status(order_id, 'accepted')
+    
+    # Уведомляем клиента
+    cursor.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
+    user_id = cursor.fetchone()[0]
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ *Ваш заказ #{order_id} принят!*\n\n"
+            f"Скоро с вами свяжется менеджер.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.answer("✅ Заказ принят!", show_alert=True)
+    await show_new_orders(callback)
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_order(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    update_order_status(order_id, 'rejected')
+    
+    # Уведомляем клиента
+    cursor.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
+    user_id = cursor.fetchone()[0]
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"❌ *Ваш заказ #{order_id} отклонён.*\n\n"
+            f"Вы можете оформить новый заказ или связаться с нами для уточнения деталей.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.answer("❌ Заказ отклонён!", show_alert=True)
+    await show_new_orders(callback)
+
+@dp.callback_query(F.data.startswith("reply_"))
+async def reply_to_order(callback: CallbackQuery, state: FSMContext):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    await state.update_data(reply_order_id=order_id)
+    await state.set_state(SellerReplyState.waiting_for_reply)
+    
+    await callback.message.edit_text(
+        "💬 Введите *ответ* клиенту:\n\n"
+        "Клиент получит ваше сообщение в Telegram.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="new_orders")]])
+    )
+    await callback.answer()
+
+@dp.message(SellerReplyState.waiting_for_reply)
+async def process_reply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data['reply_order_id']
+    reply_text = message.text
+    
+    update_order_status(order_id, 'accepted', reply_text)
+    
+    # Отправляем ответ клиенту
+    cursor.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
+    user_id = cursor.fetchone()[0]
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"💬 *Ответ от менеджера по заказу #{order_id}:*\n\n"
+            f"{reply_text}\n\n"
+            f"Если у вас остались вопросы, напишите нам!",
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Ответ отправлен клиенту!")
+    except:
+        await message.answer("❌ Не удалось отправить ответ (клиент заблокировал бота)")
+    
+    await state.clear()
+    await show_new_orders(await message.answer("."))
+
+@dp.callback_query(F.data == "accepted_orders")
+async def show_accepted_orders(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    orders = get_orders(status='accepted')
+    if not orders:
+        await callback.message.edit_text("📭 Нет принятых заказов.", reply_markup=seller_menu())
         await callback.answer()
         return
-    await callback.message.edit_text("📋 *Твои товары:*\n\n✅ — в наличии, ❌ — нет", reply_markup=products_keyboard(products), parse_mode="Markdown")
+    
+    text = "✅ *Принятые заказы:*\n\n"
+    for order in orders:
+        text += f"🆔 #{order[0]} - {order[2][:30]}\n📅 {order[6][:16]}\n\n"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=seller_menu())
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("prod_"))
-async def show_product_detail(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[1])
-    cursor.execute("SELECT id, name, last_price, url, target_price, category, in_stock FROM products WHERE id = ?", (product_id,))
-    product = cursor.fetchone()
-    if not product:
-        await callback.answer("Товар не найден", show_alert=True)
+@dp.callback_query(F.data == "rejected_orders")
+async def show_rejected_orders(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
         return
-    stock_text = "✅ В наличии" if product[6] else "❌ Нет в наличии"
-    target_text = f"🎯 Цель: {product[4]} ₽" if product[4] else "🎯 Цель не установлена"
-    text = f"📦 *{product[1]}*\n\n💰 Цена: {product[2]} ₽\n{stock_text}\n{target_text}\n📁 Корзина: {product[5] or 'Без корзины'}\n🔗 [Ссылка]({product[3]})"
-    await callback.message.edit_text(text, reply_markup=product_detail_keyboard(product_id), parse_mode="Markdown", disable_web_page_preview=True)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("history_"))
-async def show_price_history(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[1])
-    history = get_product_history(product_id)
-    if not history:
-        await callback.answer("Нет истории цен", show_alert=True)
+    
+    orders = get_orders(status='rejected')
+    if not orders:
+        await callback.message.edit_text("📭 Нет отклонённых заказов.", reply_markup=seller_menu())
+        await callback.answer()
         return
-    text = "📈 *История цен:*\n\n"
-    for i, (price, date) in enumerate(history[:10]):
-        date_formatted = date.split("T")[1][:5] if "T" in date else date[:16]
-        text += f"{i+1}. {price} ₽ — {date_formatted}\n"
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data=f"prod_{product_id}")]]))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("target_"))
-async def set_target_price_start(callback: CallbackQuery, state: FSMContext):
-    product_id = int(callback.data.split("_")[1])
-    await state.update_data(product_id=product_id)
-    await state.set_state(SetTargetPriceState.waiting_for_price)
-    await callback.message.edit_text("🎯 Введи целевую цену:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data=f"prod_{product_id}")]]))
-    await callback.answer()
-
-@dp.message(SetTargetPriceState.waiting_for_price)
-async def set_target_price(message: Message, state: FSMContext):
-    try:
-        target_price = float(message.text.replace(",", "."))
-    except:
-        await message.answer("❌ Введи число")
-        return
-    data = await state.get_data()
-    cursor.execute("UPDATE products SET target_price = ? WHERE id = ?", (target_price, data['product_id']))
-    conn.commit()
-    await message.answer(f"✅ Целевая цена установлена: {target_price} ₽")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("delete_"))
-async def delete_product(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[1])
-    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    cursor.execute("DELETE FROM price_history WHERE product_id = ?", (product_id,))
-    conn.commit()
-    await callback.answer("🗑 Товар удалён!", show_alert=True)
-    await show_products(callback)
-
-@dp.callback_query(F.data == "categories")
-async def show_categories(callback: CallbackQuery):
-    categories = get_user_categories(callback.from_user.id)
-    buttons = [[InlineKeyboardButton(text=f"🛒 {cat}", callback_data=f"category_{cat}")] for cat in categories]
-    buttons.append([InlineKeyboardButton(text="➕ Новая корзина", callback_data="new_category")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
-    await callback.message.edit_text("🛒 *Твои корзины:*", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(F.data == "new_category")
-async def new_category_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AddProductState.waiting_for_category_name)
-    await callback.message.edit_text("Введи название новой корзины:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="categories")]]))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("category_"))
-async def show_category_products(callback: CallbackQuery):
-    category = callback.data.replace("category_", "")
-    cursor.execute("SELECT id, name, last_price, in_stock FROM products WHERE user_id = ? AND category = ?", (callback.from_user.id, category))
-    products = cursor.fetchall()
-    if not products:
-        await callback.answer("В этой корзине нет товаров", show_alert=True)
-        return
-    text = f"🛒 *Корзина: {category}*\n\n"
-    for prod in products:
-        stock_icon = "✅" if prod[3] else "❌"
-        text += f"{stock_icon} {prod[1][:40]}\n💰 {prod[2]} ₽\n\n"
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="categories")]]))
-    await callback.answer()
-
-@dp.callback_query(F.data == "check_prices")
-async def check_prices_manual(callback: CallbackQuery):
-    await callback.message.edit_text("🔄 Проверяю цены...")
-    await check_all_prices(callback.from_user.id, callback.message)
+    
+    text = "❌ *Отклонённые заказы:*\n\n"
+    for order in orders:
+        text += f"🆔 #{order[0]} - {order[2][:30]}\n📅 {order[6][:16]}\n\n"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=seller_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "stats")
 async def show_stats(callback: CallbackQuery):
-    cursor.execute("SELECT COUNT(*) FROM products WHERE user_id = ?", (callback.from_user.id,))
-    total_products = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM products WHERE user_id = ? AND in_stock = 1", (callback.from_user.id,))
-    in_stock = cursor.fetchone()[0]
-    cursor.execute("SELECT AVG(last_price) FROM products WHERE user_id = ?", (callback.from_user.id,))
-    avg_price = cursor.fetchone()[0] or 0
-    text = f"📊 *Твоя статистика*\n\n📦 Всего товаров: {total_products}\n✅ В наличии: {in_stock}\n❌ Нет: {total_products - in_stock}\n💰 Средняя цена: {avg_price:.0f} ₽"
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    total = get_order_count()
+    pending = get_order_count('pending')
+    accepted = get_order_count('accepted')
+    rejected = get_order_count('rejected')
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'client'")
+    clients = cursor.fetchone()[0]
+    
+    text = f"📊 *Статистика*\n\n"
+    text += f"📦 Всего заказов: {total}\n"
+    text += f"⏳ В обработке: {pending}\n"
+    text += f"✅ Принято: {accepted}\n"
+    text += f"❌ Отклонено: {rejected}\n"
+    text += f"👥 Клиентов: {clients}\n"
+    
+    if total > 0:
+        text += f"\n📈 Конверсия: {accepted/total*100:.0f}%"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=seller_menu())
     await callback.answer()
 
-@dp.callback_query(F.data == "back")
-async def back_to_main(callback: CallbackQuery):
-    await callback.message.edit_text("🤖 Главное меню:", reply_markup=main_menu())
-    await callback.answer()
-
-@dp.callback_query(F.data == "help")
-async def show_help(callback: CallbackQuery):
-    text = (
-        "ℹ️ *Помощь*\n\n"
-        "📌 *Как добавить товар:*\n"
-        "1. Нажми «➕ Добавить товар»\n"
-        "2. Отправь *артикул* (просто цифры) или *ссылку*\n"
-        "3. Выбери корзину\n"
-        "4. Установи целевую цену (опционально)\n\n"
-        "📌 *Примеры:*\n"
-        "• Артикул WB: `12345678`\n"
-        "• Артикул Ozon: `123456789`\n\n"
-        "📌 *Уведомления:*\n"
-        "• 📉 При снижении цены\n"
-        "• 📈 При повышении цены\n"
-        "• ⚠️ Когда товар пропадает\n"
-        "• 🎯 При достижении цели\n\n"
-        "🔔 Проверка цен каждые 30 минут!"
+@dp.callback_query(F.data == "blocked_users")
+async def show_blocked_users(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE role = 'client' AND blocked = 1")
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        await callback.message.edit_text("📭 Нет заблокированных пользователей.", reply_markup=seller_menu())
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text(
+        f"🚫 *Заблокированные пользователи:* (всего: {count})\n\n"
+        f"Выберите пользователя для разблокировки:",
+        reply_markup=blocked_users_keyboard(),
+        parse_mode="Markdown"
     )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
     await callback.answer()
 
-# ========== ФОНОВЫЕ ЗАДАЧИ ==========
-async def check_all_prices(user_id, message=None):
-    cursor.execute("SELECT id, url, last_price, target_price, name FROM products WHERE user_id = ?", (user_id,))
-    products = cursor.fetchall()
-    changes = []
-    for prod in products:
-        price, name, in_stock = await parse_price(prod[1])
-        if price is None:
-            continue
-        old_price = prod[2]
-        target = prod[3]
-        cursor.execute("INSERT INTO price_history (product_id, price, in_stock, check_date) VALUES (?, ?, ?, ?)",
-                       (prod[0], price, 1 if in_stock else 0, datetime.now().isoformat()))
-        cursor.execute("UPDATE products SET last_price = ?, min_price = MIN(min_price, ?), max_price = MAX(max_price, ?), in_stock = ? WHERE id = ?",
-                       (price, price, price, 1 if in_stock else 0, prod[0]))
-        if in_stock == False and prod[2] > 0:
-            changes.append(("stock", prod[4], None, None))
-        elif price < old_price:
-            changes.append(("down", prod[4], old_price, price))
-        elif price > old_price:
-            changes.append(("up", prod[4], old_price, price))
-        if target and price <= target:
-            changes.append(("target", prod[4], target, price))
-        conn.commit()
-    if changes and message:
-        for change in changes:
-            if change[0] == "down":
-                await bot.send_message(user_id, f"📉 *Цена снизилась!*\n\n📦 {change[1]}\n💰 {change[2]} ₽ → {change[3]} ₽", parse_mode="Markdown")
-            elif change[0] == "up":
-                await bot.send_message(user_id, f"📈 *Цена повысилась!*\n\n📦 {change[1]}\n💰 {change[2]} ₽ → {change[3]} ₽", parse_mode="Markdown")
-            elif change[0] == "stock":
-                await bot.send_message(user_id, f"⚠️ *Товар пропал из наличия!*\n\n📦 {change[1]}", parse_mode="Markdown")
-            elif change[0] == "target":
-                await bot.send_message(user_id, f"🎯 *Достигнута целевая цена!*\n\n📦 {change[1]}\n💰 Цена: {change[3]} ₽\n🎯 Цель: {change[2]} ₽", parse_mode="Markdown")
-        if message:
-            await message.edit_text("✅ Цены проверены!", reply_markup=main_menu())
-    elif message:
-        await message.edit_text("✅ Цены не изменились.", reply_markup=main_menu())
+@dp.callback_query(F.data.startswith("unblock_"))
+async def unblock_user_callback(callback: CallbackQuery):
+    if not is_seller(callback.from_user.id):
+        await callback.answer("Доступ только для продавца!", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[1])
+    unblock_user(user_id)
+    
+    try:
+        await bot.send_message(user_id, "🔓 *Вы разблокированы!* Теперь вы можете снова пользоваться ботом.", parse_mode="Markdown")
+    except:
+        pass
+    
+    await callback.answer("✅ Пользователь разблокирован!", show_alert=True)
+    await show_blocked_users(callback)
 
-async def scheduled_check():
-    while True:
-        await asyncio.sleep(1800)  # 30 минут
-        cursor.execute("SELECT DISTINCT user_id FROM products")
-        users = cursor.fetchall()
-        for user in users:
-            await check_all_prices(user[0])
+@dp.callback_query(F.data == "about")
+async def about(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    text = (
+        "ℹ️ *О компании*\n\n"
+        "Мы — команда профессионалов в сфере IT и маркетинга.\n\n"
+        "✅ Более 5 лет опыта\n"
+        "✅ 100+ выполненных проектов\n"
+        "✅ Индивидуальный подход\n\n"
+        "С нами ваш бизнес выйдет на новый уровень!"
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "contacts")
+async def contacts(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    text = (
+        "📞 *Контакты*\n\n"
+        "📱 Телефон: +7 (999) 123-45-67\n"
+        "📧 Email: info@company.ru\n"
+        "💬 Telegram: @manager_bot\n\n"
+        "🕐 Режим работы: 10:00 - 20:00 МСК"
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu(user_id))
+    await callback.answer()
+
+@dp.callback_query(F.data == "logout")
+async def logout(callback: CallbackQuery):
+    cursor.execute("UPDATE users SET role = 'client' WHERE user_id = ?", (callback.from_user.id,))
+    conn.commit()
+    await callback.message.edit_text("🤝 Вы вышли из режима продавца.", reply_markup=client_menu())
+    await callback.answer()
+
+# ========== АВТОРИЗАЦИЯ ПРОДАВЦА ==========
+@dp.message(Command("seller"))
+async def seller_login_start(message: Message, state: FSMContext):
+    await state.set_state(SellerLoginState.waiting_for_login)
+    await message.answer("🔐 *Вход в панель продавца*\n\nВведите *логин*:", parse_mode="Markdown")
+
+@dp.message(SellerLoginState.waiting_for_login)
+async def seller_login_process(message: Message, state: FSMContext):
+    if message.text == SELLER_LOGIN:
+        await state.update_data(login=message.text)
+        await state.set_state(SellerLoginState.waiting_for_password)
+        await message.answer("🔐 Введите *пароль*:", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Неверный логин. Попробуйте ещё раз или напишите /start")
+        await state.clear()
+
+@dp.message(SellerLoginState.waiting_for_password)
+async def seller_password_process(message: Message, state: FSMContext):
+    if message.text == SELLER_PASSWORD:
+        cursor.execute("UPDATE users SET role = 'seller' WHERE user_id = ?", (message.from_user.id,))
+        conn.commit()
+        await message.answer(
+            "✅ *Добро пожаловать в панель продавца!*\n\n"
+            "📋 Новые заказы — принимайте и отвечайте клиентам.\n"
+            "📊 Статистика — отслеживайте эффективность.\n"
+            "🚫 Блокировка — управляйте доступом пользователей.",
+            parse_mode="Markdown",
+            reply_markup=seller_menu()
+        )
+    else:
+        await message.answer("❌ Неверный пароль. Попробуйте ещё раз или напишите /start")
+    await state.clear()
 
 # ========== ВЕБ-СЕРВЕР И САМОПИНГ ==========
 async def health_check(request):
@@ -612,13 +696,13 @@ async def health_check(request):
 
 async def self_ping():
     while True:
-        await asyncio.sleep(600)  # 10 минут
+        await asyncio.sleep(600)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(RENDER_URL, timeout=10) as resp:
                     print(f"[SELF-PING] {resp.status} - {datetime.now().strftime('%H:%M:%S')}")
-        except Exception as e:
-            print(f"[SELF-PING] Ошибка: {e}")
+        except:
+            pass
 
 async def start_web():
     app = web.Application()
@@ -633,12 +717,11 @@ async def start_web():
 
 # ========== ЗАПУСК ==========
 async def main():
-    print("✅ Бот-парсер цен запущен!")
+    print("✅ CRM-бот запущен!")
     print(f"📍 Адрес: {RENDER_URL}")
     await start_web()
     asyncio.create_task(self_ping())
-    asyncio.create_task(scheduled_check())
-    print("🔄 Самопинг (каждые 10 минут) и проверка цен (каждые 30 минут) запущены")
+    print("🔄 Самопинг (каждые 10 минут) запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
