@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import aiohttp
 import sqlite3
 import re
@@ -14,7 +14,7 @@ from aiohttp import web
 
 # ========== КОНФИГ ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RENDER_URL = os.environ.get("RENDER_URL", "https://твой-бот.onrender.com")  # ЗАМЕНИ НА СВОЙ URL
+RENDER_URL = os.environ.get("RENDER_URL", "https://wbcheck.onrender.com")
 
 # База данных
 conn = sqlite3.connect("prices.db", check_same_thread=False)
@@ -72,7 +72,7 @@ class AddProductState(StatesGroup):
     waiting_for_category = State()
     waiting_for_target_price = State()
     waiting_for_category_name = State()
-    
+
 class SetTargetPriceState(StatesGroup):
     waiting_for_price = State()
 
@@ -83,10 +83,17 @@ dp = Dispatcher()
 # ========== ФУНКЦИИ ПАРСИНГА ==========
 async def parse_wildberries(url):
     try:
+        # Поддерживает как полную ссылку, так и артикул
         match = re.search(r'/(\d+)/', url)
         if not match:
-            return None, None, None
-        article = match.group(1)
+            # Может быть передан просто артикул
+            if url.isdigit():
+                article = url
+            else:
+                return None, None, None
+        else:
+            article = match.group(1)
+        
         api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
         
         async with aiohttp.ClientSession() as session:
@@ -106,9 +113,22 @@ async def parse_wildberries(url):
 
 async def parse_ozon(url):
     try:
+        # Поддерживает как полную ссылку, так и артикул
+        match = re.search(r'/product/(\d+)', url)
+        if not match:
+            # Может быть передан просто артикул
+            if url.isdigit():
+                article = url
+            else:
+                return None, None, None
+        else:
+            article = match.group(1)
+        
+        ozon_url = f"https://www.ozon.ru/product/{article}/"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=15) as resp:
+            async with session.get(ozon_url, headers=headers, timeout=15) as resp:
                 html = await resp.text()
                 price_match = re.search(r'"price":\s*"([\d\s]+)"', html)
                 if not price_match:
@@ -122,11 +142,23 @@ async def parse_ozon(url):
         print(f"Ошибка Ozon: {e}")
         return None, None, None
 
-async def parse_price(url):
-    if "wildberries" in url.lower():
-        return await parse_wildberries(url)
-    elif "ozon" in url.lower():
-        return await parse_ozon(url)
+async def parse_price(url_or_article):
+    """Определяет маркетплейс и парсит цену по ссылке или артикулу"""
+    # Если это просто цифры - пробуем оба маркетплейса
+    if url_or_article.isdigit():
+        # Сначала Wildberries
+        price, name, in_stock = await parse_wildberries(url_or_article)
+        if price:
+            return price, name, in_stock
+        # Если не нашли на WB, пробуем Ozon
+        price, name, in_stock = await parse_ozon(url_or_article)
+        return price, name, in_stock
+    
+    # Это ссылка
+    if "wildberries" in url_or_article.lower():
+        return await parse_wildberries(url_or_article)
+    elif "ozon" in url_or_article.lower():
+        return await parse_ozon(url_or_article)
     else:
         return None, None, None
 
@@ -199,6 +231,9 @@ async def start_command(message: Message):
         "• 🛒 Корзины для группировки\n"
         "• 🎯 Целевая цена\n"
         "• 📊 График цен\n\n"
+        "📌 *Как добавить товар:*\n"
+        "• По артикулу: просто введи цифры (12345678)\n"
+        "• По ссылке: отправь ссылку с WB или Ozon\n\n"
         "👇 Выбери действие:",
         reply_markup=main_menu(),
         parse_mode="Markdown"
@@ -208,26 +243,36 @@ async def start_command(message: Message):
 async def add_product_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddProductState.waiting_for_url)
     await callback.message.edit_text(
-        "🔗 Отправь ссылку на товар с Wildberries или Ozon:\n\n"
-        "Примеры:\n"
-        "• https://www.wildberries.ru/catalog/12345678/detail.aspx\n"
-        "• https://www.ozon.ru/product/123456789/",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back")]])
+        "🔗 Отправь *артикул* или *ссылку* на товар:\n\n"
+        "✅ *Примеры:*\n"
+        "• Артикул WB: `12345678`\n"
+        "• Артикул Ozon: `123456789`\n"
+        "• Ссылка WB: https://www.wildberries.ru/catalog/12345678/detail.aspx\n"
+        "• Ссылка Ozon: https://www.ozon.ru/product/123456789/\n\n"
+        "❌ Нажми «Отмена» чтобы вернуться",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="back")]]),
+        parse_mode="Markdown"
     )
     await callback.answer()
 
 @dp.message(AddProductState.waiting_for_url)
 async def process_url(message: Message, state: FSMContext):
-    url = message.text.strip()
+    url_or_article = message.text.strip()
     await message.answer("🔄 Парсю товар...")
     
-    price, name, in_stock = await parse_price(url)
+    price, name, in_stock = await parse_price(url_or_article)
     
     if price is None:
-        await message.answer("❌ Не удалось распознать ссылку. Попробуй другую.")
+        await message.answer("❌ Не удалось распознать артикул или ссылку.\n\n"
+                           "✅ *Правильные форматы:*\n"
+                           "• Артикул WB: `12345678`\n"
+                           "• Артикул Ozon: `123456789`\n"
+                           "• Ссылка WB: https://www.wildberries.ru/catalog/12345678/detail.aspx\n"
+                           "• Ссылка Ozon: https://www.ozon.ru/product/123456789/",
+                           parse_mode="Markdown")
         return
     
-    await state.update_data(url=url, name=name, price=price, in_stock=in_stock)
+    await state.update_data(url=url_or_article, name=name, price=price, in_stock=in_stock)
     
     categories = get_user_categories(message.from_user.id)
     buttons = []
@@ -326,6 +371,16 @@ async def process_target_price(message: Message, state: FSMContext):
     )
     await state.clear()
 
+@dp.message(AddProductState.waiting_for_category_name)
+async def new_category_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if add_category(message.from_user.id, name):
+        await message.answer(f"✅ Корзина «{name}» создана!\n\nТеперь добавь товар заново.")
+    else:
+        await message.answer(f"❌ Корзина «{name}» уже существует")
+    await state.clear()
+    await start_command(message)
+
 @dp.callback_query(F.data == "my_products")
 async def show_products(callback: CallbackQuery):
     products = get_user_products(callback.from_user.id)
@@ -409,15 +464,6 @@ async def new_category_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введи название новой корзины:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="categories")]]))
     await callback.answer()
 
-@dp.message(AddProductState.waiting_for_category_name)
-async def new_category_name(message: Message, state: FSMContext):
-    name = message.text.strip()
-    if add_category(message.from_user.id, name):
-        await message.answer(f"✅ Корзина «{name}» создана!")
-    else:
-        await message.answer(f"❌ Корзина «{name}» уже существует")
-    await state.clear()
-
 @dp.callback_query(F.data.startswith("category_"))
 async def show_category_products(callback: CallbackQuery):
     category = callback.data.replace("category_", "")
@@ -460,11 +506,14 @@ async def back_to_main(callback: CallbackQuery):
 async def show_help(callback: CallbackQuery):
     text = (
         "ℹ️ *Помощь*\n\n"
-        "📌 *Как пользоваться:*\n"
+        "📌 *Как добавить товар:*\n"
         "1. Нажми «➕ Добавить товар»\n"
-        "2. Отправь ссылку на Wildberries или Ozon\n"
+        "2. Отправь *артикул* (просто цифры) или *ссылку*\n"
         "3. Выбери корзину\n"
         "4. Установи целевую цену (опционально)\n\n"
+        "📌 *Примеры:*\n"
+        "• Артикул WB: `12345678`\n"
+        "• Артикул Ozon: `123456789`\n\n"
         "📌 *Уведомления:*\n"
         "• 📉 При снижении цены\n"
         "• 📈 При повышении цены\n"
