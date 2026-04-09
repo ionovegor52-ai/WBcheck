@@ -81,44 +81,60 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ========== ФУНКЦИИ ПАРСИНГА ==========
-async def parse_wildberries(url):
+async def parse_wildberries(url_or_article):
     try:
-        # Поддерживает как полную ссылку, так и артикул
-        match = re.search(r'/(\d+)/', url)
+        # Извлекаем артикул
+        match = re.search(r'/(\d+)/', url_or_article)
         if not match:
-            # Может быть передан просто артикул
-            if url.isdigit():
-                article = url
+            if url_or_article.isdigit():
+                article = url_or_article
             else:
                 return None, None, None
         else:
             article = match.group(1)
         
+        # Используем официальное API Wildberries
         api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=15) as resp:
+            async with session.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15) as resp:
+                if resp.status != 200:
+                    print(f"API вернул статус {resp.status}")
+                    return None, None, None
+                
                 data = await resp.json()
+                
+                # Проверяем структуру ответа
                 products = data.get("data", {}).get("products", [])
                 if not products:
-                    return None, None, False
+                    print(f"Товар {article} не найден")
+                    return None, None, None
+                
                 product = products[0]
+                
+                # Цена в копейках, делим на 100
                 price = product.get("salePriceU", 0) / 100
+                if price == 0:
+                    price = product.get("priceU", 0) / 100
+                
                 name = product.get("name", "Неизвестный товар")
+                
+                # Проверка наличия (totalQuantity может отсутствовать)
                 in_stock = product.get("totalQuantity", 0) > 0
+                
                 return price, name, in_stock
+                
     except Exception as e:
-        print(f"Ошибка WB: {e}")
+        print(f"Ошибка парсинга WB: {e}")
         return None, None, None
 
-async def parse_ozon(url):
+async def parse_ozon(url_or_article):
     try:
-        # Поддерживает как полную ссылку, так и артикул
-        match = re.search(r'/product/(\d+)', url)
+        # Извлекаем артикул
+        match = re.search(r'/product/(\d+)', url_or_article)
         if not match:
-            # Может быть передан просто артикул
-            if url.isdigit():
-                article = url
+            if url_or_article.isdigit():
+                article = url_or_article
             else:
                 return None, None, None
         else:
@@ -130,31 +146,50 @@ async def parse_ozon(url):
         async with aiohttp.ClientSession() as session:
             async with session.get(ozon_url, headers=headers, timeout=15) as resp:
                 html = await resp.text()
-                price_match = re.search(r'"price":\s*"([\d\s]+)"', html)
-                if not price_match:
-                    price_match = re.search(r'"current_price":\s*([\d.]+)', html)
-                price = float(price_match.group(1).replace(' ', '')) if price_match else None
-                name_match = re.search(r'"name":\s*"([^"]+)"', html)
-                name = name_match.group(1) if name_match else "Неизвестный товар"
+                
+                # Ищем цену в JSON-подобных данных
+                price = None
+                name = None
+                
+                # Пробуем найти в script тегах
+                match = re.search(r'"price":"([\d\s]+)"', html)
+                if match:
+                    price = float(match.group(1).replace(' ', ''))
+                
+                if not price:
+                    match = re.search(r'"current_price":([\d.]+)', html)
+                    if match:
+                        price = float(match.group(1))
+                
+                # Ищем название
+                match_name = re.search(r'"name":"([^"]+)"', html)
+                if match_name:
+                    name = match_name.group(1)
+                
+                if not name:
+                    name = "Неизвестный товар"
+                
                 in_stock = "Нет в наличии" not in html and "Товар закончился" not in html
+                
                 return price, name, in_stock
+                
     except Exception as e:
-        print(f"Ошибка Ozon: {e}")
+        print(f"Ошибка парсинга Ozon: {e}")
         return None, None, None
 
 async def parse_price(url_or_article):
-    """Определяет маркетплейс и парсит цену по ссылке или артикулу"""
-    # Если это просто цифры - пробуем оба маркетплейса
+    """Парсит цену по артикулу или ссылке"""
+    # Если артикул (только цифры)
     if url_or_article.isdigit():
-        # Сначала Wildberries
+        # Пробуем Wildberries
         price, name, in_stock = await parse_wildberries(url_or_article)
         if price:
             return price, name, in_stock
-        # Если не нашли на WB, пробуем Ozon
+        # Пробуем Ozon
         price, name, in_stock = await parse_ozon(url_or_article)
         return price, name, in_stock
     
-    # Это ссылка
+    # Если ссылка
     if "wildberries" in url_or_article.lower():
         return await parse_wildberries(url_or_article)
     elif "ozon" in url_or_article.lower():
