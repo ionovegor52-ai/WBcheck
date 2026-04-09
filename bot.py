@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     join_date TEXT
 )
-""")
+""") 
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS products (
